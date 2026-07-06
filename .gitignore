@@ -1,0 +1,28 @@
+# Environments
+.env
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ML / Data / Models
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/defect_history.db
+models/*.joblib
+models/*.pkl
+models/*.pt
+models/*.pth
+!models/.gitkeep
+
+# IDE & Logs
+.idea/
+.vscode/
+*.log
+.system_generated/
+scratch/
+test_pipeline.py
