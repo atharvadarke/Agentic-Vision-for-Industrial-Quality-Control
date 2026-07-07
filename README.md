@@ -40,35 +40,103 @@
 
 ## Architecture
 
+The system is structured across four horizontal layers — **UI**, **API Gateway**, **ML Core**, and **Intelligence**. GitHub renders this diagram natively.
+
+```mermaid
+flowchart TD
+    %% ── Styling ───────────────────────────────────────────────────────────
+    classDef ui        fill:#1e3a5f,stroke:#38bdf8,color:#e2edf5,stroke-width:2px
+    classDef api       fill:#1a3a2a,stroke:#22d3a0,color:#e2edf5,stroke-width:2px
+    classDef ml        fill:#2a1f3d,stroke:#a78bfa,color:#e2edf5,stroke-width:2px
+    classDef agent     fill:#3a1f1f,stroke:#f87171,color:#e2edf5,stroke-width:2px
+    classDef db        fill:#2a2a1f,stroke:#fbbf24,color:#e2edf5,stroke-width:2px
+    classDef pass_node fill:#14532d,stroke:#22d3a0,color:#bbf7d0,stroke-width:2px,font-weight:bold
+    classDef fail_node fill:#7f1d1d,stroke:#f87171,color:#fecaca,stroke-width:2px,font-weight:bold
+    classDef obs       fill:#1f2a3a,stroke:#60a5fa,color:#e2edf5,stroke-width:1px,stroke-dasharray:5
+
+    %% ── LAYER 0 — User Interface ──────────────────────────────────────────
+    subgraph UI["  🖥️  User Interface Layer"]
+        direction LR
+        GRADIO["🎛️ Gradio Dashboard\napp.py · port 7860\nDrag-drop upload · Live results"]
+        SWAGGER["📄 Swagger UI\n/docs · Interactive API tester"]
+    end
+
+    %% ── LAYER 1 — API Gateway ─────────────────────────────────────────────
+    subgraph API["  🌐  API Gateway  ·  src/api/main.py  ·  FastAPI + Uvicorn  ·  port 8000"]
+        direction LR
+        UPLOAD["📥 POST /inspect-part\nSave image to data/raw/\nUUID filename"]
+        HEALTH["💚 GET /health\nReadiness probe"]
+        PROM_EP["📊 GET /metrics\nPrometheus endpoint"]
+    end
+
+    %% ── LAYER 2 — ML Core ─────────────────────────────────────────────────
+    subgraph MLCORE["  🧠  ML Core  ·  CPU-only  ·  ≤8 GB RAM"]
+        direction TB
+        ENCODER["🔬 VisionEncoder\nsrc/encoder.py\n─────────────────\nResNet-18 backbone\nClassification head stripped\nImageNet preprocessing\neval() mode · torch.no_grad()\n─────────────────\nOutput: 512-D L2-norm vector"]
+        DETECTOR["🎯 AnomalyDetector\nsrc/detector.py\n─────────────────\nIsolationForest\ncontamination = 0.05\nn_estimators = 100\nTrained on normal samples only\n─────────────────\nOutput: status + anomaly_score"]
+        MODEL_FILE[("💾 anomaly_detector.joblib\nmodels/\nSerialized IsolationForest")]
+    end
+
+    %% ── LAYER 3 — Intelligence ────────────────────────────────────────────
+    subgraph INTEL["  🤖  Intelligence Layer  ·  Conditional — activated only on anomalies"]
+        direction TB
+        AGENT["⚙️ LangChain Agent\nsrc/agent.py\n─────────────────\nQA Specialist system prompt\ntemperature = 0.1\nStrict JSON output schema"]
+        LLM["🦙 Groq · LLaMA 3.3 70B\nExternal API call\nStructured rejection report"]
+        SQLITE[("🗄️ SQLite Defect DB\ndata/defect_history.db\n─────────────────\nsurface_scratch  · Q3 2024\ndimensional_drift · Q1 2024\ncolor_deviation  · Q4 2023\nweld_porosity    · Q2 2024\nalignment_offset · Q3 2024\nedge_burr        · Q1 2025")]
+    end
+
+    %% ── Outcome nodes ─────────────────────────────────────────────────────
+    PASS(["✅ PASS\nReturn immediately\nAgent bypassed"])
+    FAIL(["❌ FAIL\nStructured JSON report\nSeverity + action"])
+
+    %% ── Observability ─────────────────────────────────────────────────────
+    subgraph OBS["  📈  Observability"]
+        direction LR
+        PROM["Prometheus\ninspection_latency_seconds\nSummary metric"]
+        ALERT["⚠️ Latency Alert\n> 500 ms threshold\nCRITICAL log event"]
+    end
+
+    %% ── Edge flows ────────────────────────────────────────────────────────
+    GRADIO      -->|"multipart/form-data"| UPLOAD
+    SWAGGER     -->|"HTTP POST"| UPLOAD
+
+    UPLOAD      -->|"image bytes → disk"| ENCODER
+    ENCODER     -->|"512-D float32 array"| DETECTOR
+    DETECTOR    <-->|"load / save"| MODEL_FILE
+
+    DETECTOR    -->|"predict = +1 · score ≥ 0"| PASS
+    DETECTOR    -->|"predict = -1 · score < 0"| AGENT
+
+    AGENT       -->|"LIKE search · top-3 by severity"| SQLITE
+    AGENT       -->|"system prompt + anomaly context"| LLM
+    LLM         -->|"validated JSON report"| FAIL
+
+    UPLOAD      -.->|"observe latency"| PROM
+    PROM        -.->|"elapsed > 0.5s"| ALERT
+
+    HEALTH      -.->|"encoder / detector status"| GRADIO
+    PROM_EP     -.->|"raw metrics text"| GRADIO
+
+    %% ── Class assignments ─────────────────────────────────────────────────
+    class GRADIO,SWAGGER ui
+    class UPLOAD,HEALTH,PROM_EP api
+    class ENCODER,DETECTOR,MODEL_FILE ml
+    class AGENT,LLM agent
+    class SQLITE db
+    class PASS pass_node
+    class FAIL fail_node
+    class PROM,ALERT obs
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     FastAPI REST API                        │
-│                  POST /inspect-part                         │
-└────────────────────────┬────────────────────────────────────┘
-                         │ Upload Image
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│              VisionEncoder (src/encoder.py)                 │
-│   ResNet-18 backbone (headless) — CPU-only, no gradients    │
-│   Output: 512-dimensional L2-normalized feature vector      │
-└────────────────────────┬────────────────────────────────────┘
-                         │ Feature Vector (512-D)
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│            AnomalyDetector (src/detector.py)                │
-│   IsolationForest — trained on normal embeddings only       │
-│   Output: { status: "Normal" | "Anomaly", anomaly_score }   │
-└────────────┬───────────────────────────┬────────────────────┘
-             │ Normal (95%+)             │ Anomaly
-             ▼                           ▼
-         ┌────────┐        ┌─────────────────────────────────┐
-         │  PASS  │        │     LangChain Agent Layer        │
-         │  ✅    │        │         (src/agent.py)           │
-         └────────┘        │  1. Query SQLite defect history  │
-                           │  2. Send to Groq LLaMA 3.3 70B  │
-                           │  3. Parse structured JSON report │
-                           └─────────────────────────────────┘
-```
+
+### Layer Summary
+
+| Layer | Components | Responsibility |
+|---|---|---|
+| **UI** | Gradio Dashboard, Swagger UI | User-facing interfaces for uploading images and viewing results |
+| **API Gateway** | FastAPI + Uvicorn (port 8000) | Request routing, image persistence, latency measurement |
+| **ML Core** | VisionEncoder + AnomalyDetector | CPU-bound feature extraction and anomaly classification |
+| **Intelligence** | LangChain Agent + Groq LLaMA 3.3 70B + SQLite | Conditional deep reasoning — fires only on anomalies |
+| **Observability** | Prometheus client | Latency tracking + 500 ms assembly-line safety alert |
 
 ---
 
