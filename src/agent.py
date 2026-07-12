@@ -16,16 +16,11 @@ Design Rationale:
 import os
 import json
 import sqlite3
-from dotenv import load_dotenv
 
+from src.config import settings
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 
-# Load environment variables from .env
-load_dotenv()
-
-# ─── Path to the local SQLite database ───────────────────────────────────────
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "defect_history.db")
 
 
 def _initialize_database() -> None:
@@ -33,7 +28,7 @@ def _initialize_database() -> None:
     Create the SQLite database and seed it with mock historical defect records.
     This runs once on first use. The database file is placed under data/.
     """
-    db_path = os.path.abspath(DB_PATH)
+    db_path = settings.db_path
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
     conn = sqlite3.connect(db_path)
@@ -125,7 +120,7 @@ def query_historical_defects(defect_signature: str) -> str:
     # Ensure DB exists and is seeded
     _initialize_database()
 
-    db_path = os.path.abspath(DB_PATH)
+    db_path = settings.db_path
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
@@ -183,12 +178,11 @@ def run_agent(image_path: str, anomaly_score: float) -> dict:
     # Step 1: Query historical defects using the anomaly context
     historical_context = query_historical_defects("anomaly")
 
-    # Step 2: Initialize the LLM
-    api_key = os.getenv("GROQ_API_KEY", "")
+    # Step 2: Initialize the LLM using settings (no raw os.getenv)
     llm = ChatGroq(
-        model="llama-3.3-70b-versatile",
-        temperature=0.1,  # Low temperature for deterministic QA reports
-        groq_api_key=api_key,  # type: ignore[arg-type]
+        model=settings.groq_model,
+        temperature=settings.llm_temperature,
+        groq_api_key=settings.groq_api_key,  # type: ignore[arg-type]
     )
 
     # Step 3: Construct the strict system prompt

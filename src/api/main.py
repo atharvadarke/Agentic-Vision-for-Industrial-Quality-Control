@@ -11,93 +11,95 @@ Architecture:
     - On startup: loads VisionEncoder (ResNet-18) and AnomalyDetector (IsolationForest)
     - Single Uvicorn worker process to prevent RAM duplication on edge devices
     - Agent layer activates ONLY for anomalous frames to conserve compute
+    - All business logic and validation delegated to InspectionService (services.py)
+    - All config sourced from AppSettings (config.py) — no hardcoded paths/values
 """
 
 import os
 import sys
-import time
-import uuid
 import logging
-from typing import Optional
 from contextlib import asynccontextmanager
+from typing import Optional
 
 # Ensure project root is in sys.path for IDE module resolution and standalone execution
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from prometheus_client import Summary, make_asgi_app
 
 # ─── Project Imports ─────────────────────────────────────────────────────────
-from src.encoder import VisionEncoder
+from src.config import settings
 from src.detector import AnomalyDetector
-from src.agent import run_agent
+from src.encoder import VisionEncoder
+from src.api.schemas import HealthResponse, InspectionResponse
+from src.api.services import InspectionService, build_health_response
 
 # ─── Logging Configuration ───────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, settings.log_level),
     format="[%(asctime)s] %(levelname)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("agentic_vision")
 
 # ─── Prometheus Metrics ──────────────────────────────────────────────────────
 INSPECTION_LATENCY = Summary(
     "inspection_latency_seconds",
-    "Time spent processing a single /inspect-part request (seconds)"
+    "Time spent processing a single /inspect-part request (seconds)",
 )
 
-# Latency threshold for assembly line safety (500ms)
-LATENCY_THRESHOLD_SECONDS = 0.5
-
-# ─── Global Model References (loaded on startup) ─────────────────────────────
+# ─── Global Model & Service References (loaded on startup) ───────────────────
 encoder: Optional[VisionEncoder] = None
 detector: Optional[AnomalyDetector] = None
-
-# Path configuration
-BASE_DIR = _PROJECT_ROOT
-RAW_DATA_DIR = os.path.join(BASE_DIR, "data", "raw")
-MODEL_PATH = os.path.join(BASE_DIR, "models", "anomaly_detector.joblib")
+inspection_service: Optional[InspectionService] = None
 
 
 async def startup_event():
     """
-    Initialize models on application startup:
+    Initialize models and service layer on application startup:
     1. Load VisionEncoder (ResNet-18 backbone) — ~44MB RAM
     2. Load AnomalyDetector (IsolationForest) — if trained model exists
+    3. Instantiate InspectionService with both models
 
+    All path and model config is sourced from AppSettings (src/config.py).
     If no trained model exists, the detector is initialized but untrained.
     A training script must be run separately to generate the model weights.
     """
-    global encoder, detector
+    global encoder, detector, inspection_service
 
     logger.info("=" * 60)
     logger.info("AGENTIC VISION — STARTING UP")
     logger.info("=" * 60)
 
     # Step 1: Initialize Vision Encoder
-    logger.info("[1/2] Loading VisionEncoder (ResNet-18, CPU-only)...")
+    logger.info("[1/3] Loading VisionEncoder (ResNet-18, CPU-only)...")
     encoder = VisionEncoder()
-    logger.info("[1/2] VisionEncoder loaded successfully.")
+    logger.info("[1/3] VisionEncoder loaded successfully.")
 
     # Step 2: Initialize Anomaly Detector
-    logger.info("[2/2] Loading AnomalyDetector (IsolationForest)...")
+    logger.info("[2/3] Loading AnomalyDetector (IsolationForest)...")
     detector = AnomalyDetector()
 
-    if os.path.exists(MODEL_PATH):
-        detector.load_model(MODEL_PATH)
-        logger.info(f"[2/2] AnomalyDetector loaded from: {MODEL_PATH}")
+    if os.path.exists(settings.model_path):
+        detector.load_model(settings.model_path)
+        logger.info(f"[2/3] AnomalyDetector loaded from: {settings.model_path}")
     else:
         logger.warning(
-            f"[2/2] No trained model found at {MODEL_PATH}. "
+            f"[2/3] No trained model found at {settings.model_path}. "
             "Detector initialized but NOT trained. "
             "Run the training script to generate model weights."
         )
 
+    # Step 3: Instantiate InspectionService (business logic + validation layer)
+    logger.info("[3/3] Instantiating InspectionService...")
+    inspection_service = InspectionService(encoder=encoder, detector=detector)
+    logger.info("[3/3] InspectionService ready.")
+
     # Ensure upload directory exists
-    os.makedirs(RAW_DATA_DIR, exist_ok=True)
+    os.makedirs(settings.raw_data_dir, exist_ok=True)
 
     logger.info("=" * 60)
     logger.info("STARTUP COMPLETE — READY FOR INSPECTION")
@@ -123,117 +125,88 @@ metrics_app = make_asgi_app()
 app.mount("/metrics", metrics_app)
 
 
-@app.post("/inspect-part")
+# ─── Endpoints ───────────────────────────────────────────────────────────────
+
+@app.post(
+    "/inspect-part",
+    response_model=InspectionResponse,
+    summary="Inspect a part image for manufacturing defects",
+    response_description="Validated inspection result with detection, optional agent report, and latency metadata.",
+)
 async def inspect_part(file: UploadFile = File(...)):
     """
-    Core inspection endpoint — processes a single part image through the pipeline.
+    Core inspection endpoint — processes a single part image through the full pipeline.
 
     Pipeline Flow:
-        1. Save uploaded image to data/raw/
+        1. Save uploaded image to data/raw/ (path from AppSettings)
         2. Extract 512-D feature vector via VisionEncoder
         3. Classify as Normal/Anomaly via AnomalyDetector
-        4. If Anomaly → activate LangChain agent for rejection report
-        5. If Normal → bypass agent, return pass status
+        4. If Anomaly → activate LangChain agent for validated rejection report
+        5. Compose and return a validated InspectionResponse via Pydantic schema
 
-    Returns:
-        JSON response with inspection results and optional agent analysis.
+    All outputs are validated through Pydantic schemas in InspectionService
+    before reaching this response boundary.
     """
-    # Start latency timer
-    start_time = time.time()
+    # ── Guard: models must be loaded ────────────────────────────────────
+    if inspection_service is None or encoder is None or detector is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Models not loaded. Server is still starting up.",
+        )
+
+    if not detector._is_trained:
+        raise HTTPException(
+            status_code=503,
+            detail="AnomalyDetector is not trained. Run the training script first.",
+        )
 
     try:
-        # ── Validate model state ─────────────────────────────────────────
-        if encoder is None or detector is None:
-            raise HTTPException(
-                status_code=503,
-                detail="Models not loaded. Server is still starting up."
-            )
+        # ── Delegate full pipeline to InspectionService ──────────────────
+        # InspectionService handles: save → encode → detect → agent → validate
+        file_bytes = await file.read()
+        response: InspectionResponse = inspection_service.run_full_inspection(
+            file_bytes=file_bytes,
+            original_filename=file.filename,
+        )
 
-        if not detector._is_trained:
-            raise HTTPException(
-                status_code=503,
-                detail="AnomalyDetector is not trained. Run the training script first."
-            )
+        # ── Record Prometheus latency metric ─────────────────────────────
+        INSPECTION_LATENCY.observe(response.metadata.processing_time_seconds)
 
-        # ── Step 0: Save uploaded file ───────────────────────────────────
-        file_id = str(uuid.uuid4())[:8]
-        file_extension = os.path.splitext(file.filename)[1] if file.filename else ".jpg"
-        saved_filename = f"part_{file_id}{file_extension}"
-        saved_path = os.path.join(RAW_DATA_DIR, saved_filename)
+        logger.info(
+            f"[INSPECT] {response.status} — "
+            f"score={response.detection.anomaly_score:.4f}, "
+            f"latency={response.metadata.processing_time_seconds:.3f}s"
+        )
 
-        contents = await file.read()
-        with open(saved_path, "wb") as f:
-            f.write(contents)
-
-        logger.info(f"[INSPECT] Image saved: {saved_filename}")
-
-        # ── Step 1: Feature Extraction ───────────────────────────────────
-        logger.info("[INSPECT] Step 1 — Extracting features via ResNet-18...")
-        features = encoder.extract_features(saved_path)
-        logger.info(f"[INSPECT] Feature vector shape: {features.shape}")
-
-        # ── Step 2: Anomaly Detection ────────────────────────────────────
-        logger.info("[INSPECT] Step 2 — Running IsolationForest prediction...")
-        detection_result = detector.predict(features)
-        status = detection_result["status"]
-        anomaly_score = detection_result["anomaly_score"]
-        logger.info(f"[INSPECT] Detection: {status} (score: {anomaly_score:.4f})")
-
-        # ── Step 3: Conditional Agent Activation ─────────────────────────
-        agent_analysis = None
-
-        if status == "Anomaly":
-            logger.warning("[INSPECT] [ALERT] ANOMALY DETECTED — Activating LangChain agent...")
-            agent_analysis = run_agent(saved_path, anomaly_score)
-            logger.warning(f"[INSPECT] Agent report generated: {agent_analysis}")
-            response_status = "Fail"
-        else:
-            logger.info("[INSPECT] [OK] Part is NORMAL — Agent bypassed.")
-            response_status = "Pass"
-
-        # ── Latency Check ────────────────────────────────────────────────
-        elapsed = time.time() - start_time
-        INSPECTION_LATENCY.observe(elapsed)
-
-        if elapsed > LATENCY_THRESHOLD_SECONDS:
-            logger.critical(
-                "[CRITICAL ALERT] ASSEMBLY LINE HALT: "
-                f"LATENCY THRESHOLD EXCEEDED ({elapsed:.3f}s > {LATENCY_THRESHOLD_SECONDS}s)"
-            )
-            print(
-                "[CRITICAL ALERT] ASSEMBLY LINE HALT: LATENCY THRESHOLD EXCEEDED"
-            )
-
-        # ── Build Response ───────────────────────────────────────────────
-        response = {
-            "status": response_status,
-            "detection": detection_result,
-            "agent_analysis": agent_analysis,
-            "metadata": {
-                "image_file": saved_filename,
-                "processing_time_seconds": round(elapsed, 4),
-                "latency_alert": elapsed > LATENCY_THRESHOLD_SECONDS,
-            }
-        }
-
-        logger.info(f"[INSPECT] Response sent in {elapsed:.3f}s")
-        return JSONResponse(content=response)
+        # Return validated Pydantic model (FastAPI serialises via response_model)
+        return response
 
     except HTTPException:
         raise
+    except RuntimeError as e:
+        # Raised by InspectionService when detector is untrained (safety check)
+        logger.error(f"[INSPECT] Runtime error: {e}")
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
-        elapsed = time.time() - start_time
-        INSPECTION_LATENCY.observe(elapsed)
-        logger.error(f"[INSPECT] Pipeline error: {str(e)}")
+        logger.error(f"[INSPECT] Unexpected pipeline error: {e}")
         raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)}")
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    summary="Service readiness check",
+    response_description="Current load status of VisionEncoder and AnomalyDetector.",
+)
 async def health_check():
-    """Simple health check endpoint for Docker/Kubernetes readiness probes."""
-    return {
-        "status": "healthy",
-        "encoder_loaded": encoder is not None,
-        "detector_loaded": detector is not None,
-        "detector_trained": detector._is_trained if detector else False,
-    }
+    """
+    Health check endpoint for Docker/Kubernetes readiness and liveness probes.
+
+    Returns a validated HealthResponse indicating whether the encoder and
+    detector are loaded and ready for inference.
+    """
+    return build_health_response(
+        encoder_loaded=encoder is not None,
+        detector_loaded=detector is not None,
+        detector_trained=detector._is_trained if detector else False,
+    )
