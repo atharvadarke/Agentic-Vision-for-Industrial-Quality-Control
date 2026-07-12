@@ -10,6 +10,9 @@ __pycache__/
 # ML / Data / Models
 data/raw/*
 !data/raw/.gitkeep
+!data/raw/*.jpg
+!data/raw/*.jpeg
+!data/raw/*.png
 data/processed/*
 !data/processed/.gitkeep
 data/defect_history.db
