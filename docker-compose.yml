@@ -1,0 +1,101 @@
+# =============================================================================
+# docker-compose.yml — Agentic Vision for Industrial Quality Control
+# =============================================================================
+#
+# Services:
+#   api        → FastAPI + Uvicorn (port 8000)  — inference & REST endpoints
+#   dashboard  → Gradio UI        (port 7860)  — interactive web dashboard
+#
+# Usage:
+#   docker compose up --build          # build & start both services
+#   docker compose up --build api      # start only the backend
+#   docker compose logs -f api         # stream API logs
+#   docker compose down -v             # stop & remove containers + volumes
+#
+# Environment:
+#   Copy .env.example → .env and fill in your GROQ_API_KEY before running.
+#
+# Local dev scripts (run directly without Docker):
+#   python test_pipeline.py                      # end-to-end verification
+#   python benchmark_inference.py                # accuracy & latency benchmarks
+#   python scripts/download_real_samples.py      # seed data/raw/ with images
+# =============================================================================
+
+version: "3.9"
+
+services:
+
+  # ── FastAPI Backend ─────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: agentic_vision_api
+    restart: unless-stopped
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - RAW_DATA_DIR=/app/data/raw
+      - MODEL_PATH=/app/models/anomaly_detector.joblib
+      - DB_PATH=/app/data/defect_history.db
+      - LOG_LEVEL=INFO
+
+    volumes:
+      - model_data:/app/models
+      - app_data:/app/data
+
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+    networks:
+      - agentic_net
+
+  # ── Gradio Dashboard ──────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+    container_name: agentic_vision_dashboard
+    restart: unless-stopped
+
+    ports:
+      - "7860:7860"
+
+    environment:
+      - API_BASE=http://api:8000
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - DB_PATH=/app/data/defect_history.db
+
+    volumes:
+      - app_data:/app/data
+
+    depends_on:
+      api:
+        condition: service_healthy
+
+    networks:
+      - agentic_net
+
+# =============================================================================
+# Named Volumes — persisted across container restarts
+# =============================================================================
+volumes:
+  model_data:
+    driver: local
+  app_data:
+    driver: local
+
+# =============================================================================
+# Internal Network — services communicate by service name (api, dashboard)
+# =============================================================================
+networks:
+  agentic_net:
+    driver: bridge
