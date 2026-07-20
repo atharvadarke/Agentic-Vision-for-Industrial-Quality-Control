@@ -1,0 +1,72 @@
+# =============================================================================
+# .dockerignore — Agentic Vision for Industrial Quality Control
+# =============================================================================
+# Excludes files that bloat the Docker build context.
+# This dramatically speeds up `docker build` and keeps images lean.
+# =============================================================================
+
+# ── Python Artifacts ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.egg-info/
+.eggs/
+dist/
+build/
+*.whl
+
+# ── Virtual Environment ───────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Version Control ───────────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+.github/
+
+# ── IDE & Editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Testing & Benchmarks (run locally, not inside Docker) ────────────────────
+test_pipeline.py
+benchmark_inference.py
+scripts/
+
+# ── Docs & Non-essential ──────────────────────────────────────────────────────
+README.md
+LICENSE
+*.md
+
+# ── Data — only copy what's needed (volumes handle runtime data) ─────────────────────────
+# Raw inspection images are uploaded at runtime, not baked into the image.
+data/raw/
+data/*.db
+
+# NOTE: models/ is intentionally NOT excluded — the trained anomaly_detector.joblib
+# is baked into the API image so it works standalone without a pre-existing volume.
+# The docker-compose model_data volume can overlay this for live model updates.
+
+# ── Docker files themselves (no need to COPY into image) ─────────────────────
+docker-compose.yml
+docker-compose.override.yml
+.dockerignore
+
+# ── Secrets (never bake .env into image; use docker-compose env: or secrets) ──
+# .env is INTENTIONALLY kept here because the API service needs GROQ_API_KEY at
+# build time for config validation. For production, switch to Docker secrets.
+# Uncomment the line below when using proper secret management in production:
+# .env
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
