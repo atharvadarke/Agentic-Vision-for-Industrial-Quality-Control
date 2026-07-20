@@ -1,0 +1,40 @@
+# =============================================================================
+# Dockerfile.dashboard — Gradio Dashboard Service
+# =============================================================================
+# Runs app.py (Gradio UI) on port 7860.
+# Communicates with the FastAPI container via the Docker network (api:8000).
+# API_BASE is injected at runtime via docker-compose environment.
+# =============================================================================
+
+FROM python:3.10-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+# ── System Dependencies ───────────────────────────────────────────────────────
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python Dependencies ───────────────────────────────────────────────────────
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ── Application Code ──────────────────────────────────────────────────────────
+COPY app.py .
+COPY src/ ./src/
+COPY .env .
+
+# ── Ensure data directory exists for SQLite DB path resolution ─────────────
+RUN mkdir -p data
+
+# ── Expose Gradio Port ────────────────────────────────────────────────────────
+EXPOSE 7860
+
+# ── Launch Gradio Dashboard ───────────────────────────────────────────────────
+# API_BASE is set to http://api:8000 by docker-compose (overrides localhost default)
+CMD ["python", "app.py"]
