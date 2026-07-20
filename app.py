@@ -28,8 +28,8 @@ load_dotenv()
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
-API_BASE  = "http://localhost:8000"
-DB_PATH   = os.path.join(BASE_DIR, "data", "defect_history.db")
+API_BASE  = os.environ.get("API_BASE", "http://localhost:8000")
+DB_PATH   = os.environ.get("DB_PATH", os.path.join(BASE_DIR, "data", "defect_history.db"))
 
 # ─── Custom CSS (dark-industrial theme) ──────────────────────────────────────
 CSS = """
